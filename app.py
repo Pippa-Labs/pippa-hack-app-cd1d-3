@@ -1,38 +1,16 @@
-"""Your app. Replace this with whatever you are building.
+"""Ride Ready: an honest estimate of ride-hail availability in London.
 
-The shape never changes, whatever your app does:
-
-    class App:
-        manifest  -> the parsed manifest.yaml sitting next to this file
-        handle(call) -> Result
-
-`handle` is called once per request and must return a `Result` whose `data`
-matches the `output` your manifest declares for that outcome — exactly: every
-declared field present, nothing extra, right types. The runtime checks it and
-refuses anything that does not match, which is deliberate. An app that can
-return surprise fields is an app Pippa cannot describe to a user before they
-install it.
-
-Three things worth knowing before you start:
-
-**You get the inputs, and nothing about who asked.** No user id, no account,
-no conversation. `call.inputs` is what Pippa extracted from the message;
-besides it, `call.context` carries only the time, an id for your logs, and
-whether the person picked your app by name. This is on purpose: your app
-cannot leak what it was never given.
-
-**You keep nothing.** A fresh copy of this class is built for every call and
-thrown away afterwards. Writing to a file or a global will appear to work and
-then silently stop, because the next call may be on a different machine.
-
-**Errors are part of the design.** Raise `AgentAppError` with a `user_message`
-when you cannot answer. That message is the one a user may see; everything
-else — the exception type, the traceback — stays in the logs.
+Uber, Bolt and the rest publish no free availability API, so this app
+estimates from time-of-week patterns, UK bank holidays and the Open-Meteo
+rain forecast (best-effort, no key). It never claims live driver data.
 """
 
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
+import json
+import urllib.error
+import urllib.request
+from datetime import date, datetime, time
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -46,133 +24,196 @@ from pippa_agentapp_sdk import (
 )
 
 MANIFEST_PATH = Path(__file__).with_name("manifest.yaml")
+LONDON = ZoneInfo("Europe/London")
+USER_AGENT = "pippa-agent-app-ride-ready/0.1 (https://github.com/Pippa-Labs)"
+FORECAST_URL = (
+    "https://api.open-meteo.com/v1/forecast?latitude=51.5074&longitude=-0.1278"
+    "&hourly=precipitation_probability&timezone=Europe/London&forecast_days=7"
+)
+
+LEVELS = ["low", "normal", "busy", "high", "very high"]
+WAITS = {
+    "low": "about 5-12 minutes (fewer drivers about)",
+    "normal": "about 2-5 minutes",
+    "busy": "about 4-8 minutes",
+    "high": "about 8-15 minutes, with surge pricing",
+    "very high": "15 minutes or more, with heavy surge pricing",
+}
+APPS_TO_TRY = ["Uber", "Bolt", "FREENOW", "Addison Lee"]
+
+# England and Wales bank holidays, 2026-2027.
+BANK_HOLIDAYS = {
+    date(2026, 1, 1), date(2026, 4, 3), date(2026, 4, 6), date(2026, 5, 4),
+    date(2026, 5, 25), date(2026, 8, 31), date(2026, 12, 25), date(2026, 12, 28),
+    date(2027, 1, 1), date(2027, 3, 26), date(2027, 3, 29), date(2027, 5, 3),
+    date(2027, 5, 31), date(2027, 8, 30), date(2027, 12, 27), date(2027, 12, 28),
+}
+
+NIGHT_TUBE_LINES = "Central, Jubilee, Northern, Piccadilly and Victoria lines"
 
 
-class CannotReadDate(AgentAppError):
-    """Raised when the message did not contain a date we can work with."""
-
-    # What a user may be shown. Write it as a sentence, not an error code.
-    user_message = "I could not work out which date you meant."
+class CannotReadTime(AgentAppError):
+    user_message = (
+        "I could not work out the date and time. Try something like "
+        "\"Saturday 11pm\" or \"21 November at 23:30\"."
+    )
     retryable = False
 
 
 class App:
-    """A small, complete example: count the days until a date."""
-
     def __init__(self) -> None:
-        # Validated at construction, so an app whose manifest is wrong fails
-        # immediately and loudly rather than on some later call.
         self._manifest = validate_manifest(load_manifest_file(MANIFEST_PATH))
 
     @property
     def manifest(self) -> Manifest:
         return self._manifest
 
-    def handle(self, call: Call) -> Result:
-        """One request in, one Result out.
+    def _fetch(self, url: str, timeout: float = 4.0) -> bytes:
+        request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return response.read()
 
-        `call.outcome_id` says which of your manifest's outcomes was asked
-        for. With one outcome you can ignore it; with several, branch on it.
-        """
-        if call.outcome_id != "days.until":
+    def handle(self, call: Call) -> Result:
+        if call.outcome_id != "ride.availability":
             raise AgentAppError(f"this app cannot do {call.outcome_id!r}")
 
-        text = (call.inputs.get("date") or "").strip()
-        if not text:
-            # The manifest tells the extractor to send an empty string rather
-            # than guess, so this is the ordinary "they did not say" path.
-            #
-            # A missing or unreadable date (here, and in `_parse` below) is
-            # the only thing this app refuses for, which is why it never reads
-            # `call.context.explicit`, True when the person picked the app
-            # with @. That refusal is right whoever chose the app; the test
-            # that says so is in test_app.py.
-            raise CannotReadDate("no date in the message")
+        text = (call.inputs.get("when") or "").strip()
+        place = (call.inputs.get("place") or "").strip()
+        moment = self._parse(text) if text else call.context.now.astimezone(LONDON)
 
-        # `call.context.now` is the current time, supplied by the runtime
-        # rather than read from the clock. That is what makes an app testable:
-        # a test can say what "now" is.
-        today = self._today(call)
-        target = self._parse(text, today)
-        difference = (target - today).days
+        level, reasons = self._demand(moment)
+        night_tube = self._night_tube(moment)
+        tube = self._tube(moment)
 
-        return Result(
-            data={
-                "days": abs(difference),
-                "target_date": target.isoformat(),
-                "weekday": target.strftime("%A"),
-                "already_passed": difference < 0,
-            },
-            # Optional. One plain sentence Pippa may use when it writes its
-            # reply. Say what you found, not what you did.
-            narrative=self._sentence(target, difference),
+        rain = self._rain(moment)
+        if rain is not None and rain >= 50:
+            reasons.append(f"Rain is likely ({rain}%), which pushes demand up.")
+            level = LEVELS[min(LEVELS.index(level) + 1, len(LEVELS) - 1)]
+
+        if night_tube:
+            reasons.append(
+                f"The Night Tube runs on the {NIGHT_TUBE_LINES}, and the "
+                "Overground between Highbury & Islington and New Cross Gate."
+            )
+        elif not tube:
+            reasons.append("The Tube is closed then, so night buses are the fallback.")
+        if place:
+            reasons.append(f"These are London-wide patterns, not specific to {place}.")
+
+        when_used = (
+            f"{moment.strftime('%A')} {moment.day} {moment.strftime('%B')} "
+            f"{moment.year}, {moment.strftime('%H:%M')} London time"
         )
+        surge = level in ("high", "very high")
+        data = {
+            "when_used": when_used,
+            "day": moment.strftime("%A"),
+            "demand_level": level,
+            "surge_likely": surge,
+            "wait_estimate": WAITS[level],
+            "night_tube_running": night_tube,
+            "tube_running": tube,
+            "reasons": reasons,
+            "apps_to_try": list(APPS_TO_TRY),
+        }
+        if rain is not None:
+            data["rain_chance_percent"] = rain
 
-    @staticmethod
-    def _today(call: Call) -> date:
-        """The user's today, not the server's.
-
-        A server in UTC and a user in Auckland disagree about what day it is
-        for twelve hours out of every twenty-four, and "how many days until"
-        is exactly the question that notices.
-        """
-        # No try/except around ZoneInfo, and that is the point: the manifest
-        # declares this input as `type: timezone`, so the runtime has already
-        # rejected anything that is not a real IANA zone before your code
-        # runs. Declaring the right type is cheaper than validating by hand,
-        # and the user gets a better error.
-        zone = call.inputs.get("timezone")
-        moment: datetime = call.context.now
-        if zone:
-            moment = moment.astimezone(ZoneInfo(zone))
-        return moment.date()
-
-    @staticmethod
-    def _parse(text: str, today: date) -> date:
-        """Turn what the user wrote into a date.
-
-        Deliberately small — real date parsing is its own project. Handles
-        `YYYY-MM-DD`, `25 December`, `December 25` and a bare day number.
-        """
-        cleaned = text.replace(",", " ").strip()
-
-        for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y"):
-            try:
-                return datetime.strptime(cleaned, fmt).date()
-            except ValueError:
-                continue
-
-        for fmt in ("%d %B", "%B %d", "%d %b", "%b %d"):
-            try:
-                parsed = datetime.strptime(cleaned, fmt).date()
-            except ValueError:
-                continue
-            # A bare day and month has no year. "25 December" asked in
-            # February means this year; asked in December means this year too,
-            # until it has passed, and then it means next year.
-            candidate = parsed.replace(year=today.year)
-            if candidate < today:
-                candidate = candidate.replace(year=today.year + 1)
-            return candidate
-
-        if cleaned.lower() == "tomorrow":
-            return today + timedelta(days=1)
-
-        raise CannotReadDate(f"could not parse {text!r} as a date")
-
-    @staticmethod
-    def _sentence(target: date, difference: int) -> str:
-        # Built by hand rather than with `%-d`, which is a GNU extension: it
-        # raises ValueError on Windows, where half of you are developing, and
-        # the failure would only show up at the last line of a working app.
-        pretty = (
-            f"{target.strftime('%A')} {target.day} "
-            f"{target.strftime('%B')} {target.year}"
+        narrative = (
+            f"This is an estimate from time patterns, not live availability: for "
+            f"{when_used}, demand is likely {level}, with a wait of "
+            f"{WAITS[level]}."
         )
-        if difference == 0:
-            return f"That is today, {pretty}."
-        if difference < 0:
-            return f"{pretty} was {abs(difference)} days ago."
-        if difference == 1:
-            return f"{pretty} is tomorrow."
-        return f"There are {difference} days until {pretty}."
+        return Result(data=data, narrative=narrative)
+
+    @staticmethod
+    def _parse(text: str) -> datetime:
+        cleaned = text.strip().replace("Z", "+00:00")
+        try:
+            parsed = datetime.fromisoformat(cleaned)
+        except ValueError:
+            parsed = None
+        if parsed is None:
+            for fmt in ("%Y-%m-%d %H:%M", "%d/%m/%Y %H:%M", "%d/%m/%Y"):
+                try:
+                    parsed = datetime.strptime(cleaned, fmt)
+                    break
+                except ValueError:
+                    continue
+        if parsed is None:
+            raise CannotReadTime(f"could not parse {text!r}")
+        if len(cleaned) <= 10 and parsed.time() == time(0, 0):
+            # A date with no time: assume an evening out.
+            parsed = parsed.replace(hour=22)
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=LONDON)
+        return parsed.astimezone(LONDON)
+
+    @staticmethod
+    def _demand(moment: datetime) -> tuple[str, list[str]]:
+        reasons: list[str] = []
+        d, minutes = moment.date(), moment.hour * 60 + moment.minute
+        weekday = moment.weekday()  # Monday = 0
+        # Before 06:00 counts as the night before.
+        night_of = (moment.toordinal() - 1) if minutes < 360 else moment.toordinal()
+        night_weekday = date.fromordinal(night_of).weekday()
+        night_date = date.fromordinal(night_of)
+
+        if (night_date.month, night_date.day) == (12, 31) and (
+            minutes >= 18 * 60 or minutes < 360
+        ):
+            return "very high", ["New Year's Eve is the busiest night of the year."]
+        if (d.month, d.day) == (12, 24) and minutes >= 18 * 60:
+            return "very high", ["Christmas Eve evenings are very busy."]
+        if d in BANK_HOLIDAYS or night_date in BANK_HOLIDAYS:
+            reasons.append("It is a bank holiday, so demand runs higher.")
+            if minutes >= 18 * 60 or minutes < 360:
+                return "very high", reasons
+
+        is_weekend_night = night_weekday in (4, 5) and (
+            minutes >= 22 * 60 or minutes < 3 * 60
+        )
+        if is_weekend_night:
+            reasons.append("Friday and Saturday late nights are peak time for rides.")
+            return "high", reasons
+        if 3 * 60 <= minutes < 6 * 60:
+            reasons.append("Between 3am and 6am few drivers are working.")
+            return "low", reasons
+        rush = (7 * 60 + 30 <= minutes < 9 * 60 + 30) or (17 * 60 <= minutes < 19 * 60)
+        if weekday < 5 and rush and d not in BANK_HOLIDAYS:
+            reasons.append("Weekday rush hour keeps drivers busy.")
+            return "busy", reasons
+        if not reasons:
+            reasons.append("An ordinary time of the week for rides.")
+        return "normal", reasons
+
+    @staticmethod
+    def _night_tube(moment: datetime) -> bool:
+        minutes = moment.hour * 60 + moment.minute
+        # Friday night and Saturday night: early hours of Saturday and Sunday.
+        return moment.weekday() in (5, 6) and 30 <= minutes < 5 * 60 + 30
+
+    @staticmethod
+    def _tube(moment: datetime) -> bool:
+        if (moment.month, moment.day) == (12, 25):
+            return False
+        minutes = moment.hour * 60 + moment.minute
+        if moment.weekday() == 6:  # Sunday: later start, earlier finish
+            return 7 * 60 <= minutes < 23 * 60 + 30
+        return minutes >= 5 * 60 + 30 or minutes < 30
+
+    def _rain(self, moment: datetime) -> int | None:
+        """Best-effort: any failure or an hour outside the forecast is None."""
+        try:
+            raw = self._fetch(FORECAST_URL)
+            hourly = json.loads(raw)["hourly"]
+            key = moment.strftime("%Y-%m-%dT%H:00")
+            index = hourly["time"].index(key)
+            value = hourly["precipitation_probability"][index]
+        except (urllib.error.HTTPError, TimeoutError, urllib.error.URLError):
+            return None
+        except (ValueError, KeyError, TypeError, IndexError, OSError):
+            return None
+        if value is None:
+            return None
+        return int(round(value))
