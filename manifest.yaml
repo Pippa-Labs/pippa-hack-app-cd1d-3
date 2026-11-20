@@ -6,13 +6,13 @@ app_author_name: "Nightingale"
 
 app:
   id: hack.app_cd1d_3
-  name: Ride Ready
+  name: Ride Radar
   version: 0.1.0
   summary: >-
-    Estimates how hard it will be to get an Uber, Bolt or other ride-hail car
-    in London at a given date and time, whether surge pricing is likely, and
-    whether the Tube or Night Tube is running instead. It uses time patterns
-    and the Open-Meteo rain forecast, not live driver data.
+    Predicts how easy it is to get an Uber, Bolt or taxi in London at a given
+    time and date, with surge risk, wait estimate and whether the Night Tube
+    is running. An estimate from time patterns and the Open-Meteo rain
+    forecast, not live driver data.
 
 agent_types:
   - personal

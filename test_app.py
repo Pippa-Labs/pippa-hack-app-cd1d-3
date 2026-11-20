@@ -1,4 +1,4 @@
-"""Tests for Ride Ready, run through LocalRunner with the network stubbed."""
+"""Tests for Ride Radar, run through LocalRunner with the network stubbed."""
 
 from __future__ import annotations
 

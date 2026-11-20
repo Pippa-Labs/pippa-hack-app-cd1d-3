@@ -1,4 +1,4 @@
-"""Ride Ready: an honest estimate of ride-hail availability in London.
+"""Ride Radar: an honest estimate of ride-hail availability in London.
 
 Uber, Bolt and the rest publish no free availability API, so this app
 estimates from time-of-week patterns, UK bank holidays and the Open-Meteo
@@ -25,7 +25,7 @@ from pippa_agentapp_sdk import (
 
 MANIFEST_PATH = Path(__file__).with_name("manifest.yaml")
 LONDON = ZoneInfo("Europe/London")
-USER_AGENT = "pippa-agent-app-ride-ready/0.1 (https://github.com/Pippa-Labs)"
+USER_AGENT = "pippa-agent-app-ride-radar/0.1 (https://github.com/Pippa-Labs)"
 FORECAST_URL = (
     "https://api.open-meteo.com/v1/forecast?latitude=51.5074&longitude=-0.1278"
     "&hourly=precipitation_probability&timezone=Europe/London&forecast_days=7"
